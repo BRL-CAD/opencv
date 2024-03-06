@@ -47,7 +47,7 @@ void check_qr(const string& root, const string& name_current_image, const string
                     EXPECT_NEAR(y, corners[i].y, max_pixel_error);
                 }
             }
-#ifdef HAVE_QUIRC
+
             if (decoded_info.size() == 0ull)
                 return;
             if (isMulti) {
@@ -67,7 +67,7 @@ void check_qr(const string& root, const string& name_current_image, const string
                 std::string original_info = config["info"];
                 EXPECT_EQ(decoded_info[0], original_info);
             }
-#endif
+
             return; // done
         }
     }
