@@ -81,6 +81,18 @@ static Mat projectCharucoBoard(aruco::CharucoBoard& board, Mat cameraMatrix, dou
     return img;
 }
 
+static bool borderPixelsHaveSameColor(const Mat& image, uint8_t color) {
+    for (int j = 0; j < image.cols; j++) {
+        if (image.at<uint8_t>(0, j) != color || image.at<uint8_t>(image.rows-1, j) != color)
+            return false;
+    }
+    for (int i = 0; i < image.rows; i++) {
+        if (image.at<uint8_t>(i, 0) != color || image.at<uint8_t>(i, image.cols-1) != color)
+            return false;
+    }
+    return true;
+}
+
 /**
  * @brief Check Charuco detection
  */
@@ -767,6 +779,111 @@ TEST_P(CharucoBoard, testWrongSizeDetection)
     // charuco corners should not be found in board with wrong size
     ASSERT_TRUE(detectedCharucoCorners.empty());
     ASSERT_TRUE(detectedCharucoIds.empty());
+}
+
+
+typedef testing::TestWithParam<std::tuple<cv::Size, float, cv::Size, int>> CharucoBoardGenerate;
+INSTANTIATE_TEST_CASE_P(/**/, CharucoBoardGenerate, testing::Values(make_tuple(Size(7, 4), 13.f, Size(400, 300), 24),
+                                                                    make_tuple(Size(12, 2), 13.f, Size(200, 150), 1),
+                                                                    make_tuple(Size(12, 2), 13.1f, Size(400, 300), 1)));
+TEST_P(CharucoBoardGenerate, issue_24806)
+{
+    aruco::Dictionary dict = aruco::getPredefinedDictionary(aruco::DICT_4X4_1000);
+    auto params = GetParam();
+    const Size boardSize = std::get<0>(params);
+    const float squareLength = std::get<1>(params), markerLength = 10.f;
+    Size imgSize = std::get<2>(params);
+    const aruco::CharucoBoard board(boardSize, squareLength, markerLength, dict);
+    const int marginSize = std::get<3>(params);
+    Mat boardImg;
+
+    // generate chessboard image
+    board.generateImage(imgSize, boardImg, marginSize);
+    // This condition checks that the width of the image determines the dimensions of the chessboard in this test
+    CV_Assert((float)(boardImg.cols) / (float)boardSize.width <=
+              (float)(boardImg.rows) / (float)boardSize.height);
+
+    // prepare data for chessboard image test
+    Mat noMarginsImg = boardImg(Range(marginSize, boardImg.rows - marginSize),
+                                Range(marginSize, boardImg.cols - marginSize));
+    const float pixInSquare = (float)(noMarginsImg.cols) / (float)boardSize.width;
+
+    Size pixInChessboard(cvRound(pixInSquare*boardSize.width), cvRound(pixInSquare*boardSize.height));
+    const Point startChessboard((noMarginsImg.cols - pixInChessboard.width) / 2,
+                                (noMarginsImg.rows - pixInChessboard.height) / 2);
+    Mat chessboardZoneImg = noMarginsImg(Rect(startChessboard, pixInChessboard));
+
+    // B - black pixel, W - white pixel
+    // chessboard corner 1:
+    // B W
+    // W B
+    Mat goldCorner1 = (Mat_<uint8_t>(2, 2) <<
+        0, 255,
+        255, 0);
+    // B - black pixel, W - white pixel
+    // chessboard corner 2:
+    // W B
+    // B W
+    Mat goldCorner2 = (Mat_<uint8_t>(2, 2) <<
+        255, 0,
+        0, 255);
+
+    // test chessboard corners in generated image
+    for (const Point3f& p: board.getChessboardCorners()) {
+        Point2f chessCorner(pixInSquare*(p.x/squareLength),
+                            pixInSquare*(p.y/squareLength));
+        Mat winCorner = chessboardZoneImg(Rect(Point(cvRound(chessCorner.x) - 1, cvRound(chessCorner.y) - 1), Size(2, 2)));
+        bool eq = (cv::countNonZero(goldCorner1 != winCorner) == 0) || (cv::countNonZero(goldCorner2 != winCorner) == 0);
+        ASSERT_TRUE(eq);
+    }
+
+    // marker size in pixels
+    const float pixInMarker = markerLength/squareLength*pixInSquare;
+    // the size of the marker margin in pixels
+    const float pixInMarginMarker = 0.5f*(pixInSquare - pixInMarker);
+
+    // determine the zone where the aruco markers are located
+    int endArucoX = cvRound(pixInSquare*(boardSize.width-1)+pixInMarginMarker+pixInMarker);
+    int endArucoY = cvRound(pixInSquare*(boardSize.height-1)+pixInMarginMarker+pixInMarker);
+    Mat arucoZone = chessboardZoneImg(Range(cvRound(pixInMarginMarker), endArucoY), Range(cvRound(pixInMarginMarker), endArucoX));
+
+    const auto& markerCorners = board.getObjPoints();
+    float minX, maxX, minY, maxY;
+    minX = maxX = markerCorners[0][0].x;
+    minY = maxY = markerCorners[0][0].y;
+    for (const auto& marker : markerCorners) {
+        for (const Point3f& objCorner : marker) {
+            minX = min(minX, objCorner.x);
+            maxX = max(maxX, objCorner.x);
+            minY = min(minY, objCorner.y);
+            maxY = max(maxY, objCorner.y);
+        }
+    }
+
+    Point2f outCorners[3];
+    for (const auto& marker : markerCorners) {
+        for (int i = 0; i < 3; i++) {
+            outCorners[i] = Point2f(marker[i].x, marker[i].y) - Point2f(minX, minY);
+            outCorners[i].x = outCorners[i].x / (maxX - minX) * float(arucoZone.cols);
+            outCorners[i].y = outCorners[i].y / (maxY - minY) * float(arucoZone.rows);
+        }
+        Size dst_sz(outCorners[2] - outCorners[0]); // assuming CCW order
+        dst_sz.width = dst_sz.height = std::min(dst_sz.width, dst_sz.height);
+        Rect borderRect = Rect(outCorners[0], dst_sz);
+
+        //The test checks the inner and outer borders of the Aruco markers.
+        //In the inner border of Aruco marker, all pixels should be black.
+        //In the outer border of Aruco marker, all pixels should be white.
+
+        Mat markerImg = arucoZone(borderRect);
+        bool markerBorderIsBlack = borderPixelsHaveSameColor(markerImg, 0);
+        ASSERT_EQ(markerBorderIsBlack, true);
+
+        Mat markerOuterBorder = markerImg;
+        markerOuterBorder.adjustROI(1, 1, 1, 1);
+        bool markerOuterBorderIsWhite = borderPixelsHaveSameColor(markerOuterBorder, 255);
+        ASSERT_EQ(markerOuterBorderIsWhite, true);
+    }
 }
 
 TEST(Charuco, testSeveralBoardsWithCustomIds)
